@@ -88,13 +88,33 @@ def signal_for(pair):
     d["macd"] = macd
     d["macd_signal"] = macd.ewm(span=9, adjust=False).mean()
     x = d.iloc[-1]
-    score = int(x.close > x.ema20) + int(x.ema20 > x.ema50) + int(x.macd > x.macd_signal)
-    score -= int(x.close <= x.ema20) + int(x.ema20 <= x.ema50) + int(x.macd <= x.macd_signal)
-    if x.rsi < 35:
-        score += 1
-    elif x.rsi > 70:
-        score -= 1
-    sig = "LONG" if score >= 2 else "SHORT" if score <= -2 else "WAIT"
+
+    # İki yönlü ve simetrik trend filtresi:
+    # LONG için üç yükseliş koşulunun, SHORT için üç düşüş koşulunun
+    # aynı anda sağlanmasını ister. Sırf işlem açmak için yön uydurmaz.
+    bullish = (
+        x.close > x.ema20 and
+        x.ema20 > x.ema50 and
+        x.macd > x.macd_signal
+    )
+    bearish = (
+        x.close < x.ema20 and
+        x.ema20 < x.ema50 and
+        x.macd < x.macd_signal
+    )
+
+    score = (
+        int(x.close > x.ema20) - int(x.close < x.ema20) +
+        int(x.ema20 > x.ema50) - int(x.ema20 < x.ema50) +
+        int(x.macd > x.macd_signal) - int(x.macd < x.macd_signal)
+    )
+    if bullish:
+        sig = "LONG"
+    elif bearish:
+        sig = "SHORT"
+    else:
+        sig = "WAIT"
+
     return float(x.close), sig, float(x.rsi), score
 
 def close_position(c, coin, pos, price, reason):
@@ -185,7 +205,7 @@ init_db()
 start_worker()
 
 st.title("📈 AI TRADER PRO — SANAL VADELİ")
-st.warning("Bu sürüm yalnızca SANAL vadeli işlem simülasyonudur. Gerçek borsaya emir göndermez. 5x kaldıraç kullanılır; sonuçlar komisyon/funding içermeyen yaklaşık simülasyondur.")
+st.warning("Bu sürüm yalnızca SANAL vadeli işlem simülasyonudur. Gerçek borsaya emir göndermez. 5x kaldıraç kullanılır; LONG ve SHORT sinyalleri ayrı ayrı değerlendirilir. Sonuçlar komisyon/funding içermeyen yaklaşık simülasyondur.")
 with db() as c:
     account = c.execute("SELECT * FROM account WHERE id=1").fetchone()
     positions = [dict(x) for x in c.execute("SELECT * FROM positions ORDER BY coin").fetchall()]
@@ -263,4 +283,4 @@ if trades:
     st.dataframe(pd.DataFrame(trades), use_container_width=True, hide_index=True)
 else:
     st.caption("Henüz işlem kaydı yok.")
-st.caption("Pozisyon boyutu: teminat × 10. Her işlemde başlangıç sermayesinin %5'i teminat olarak ayrılır. Stop-loss %2, take-profit %4; tasfiye/funding/komisyon modeli basitleştirilmiştir.")
+st.caption("Pozisyon boyutu: teminat × 5. Her işlemde başlangıç sermayesinin %5'i teminat olarak ayrılır. Stop-loss %2, take-profit %4; tasfiye/funding/komisyon modeli basitleştirilmiştir.")
