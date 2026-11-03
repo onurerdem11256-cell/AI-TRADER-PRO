@@ -18,7 +18,7 @@ BASE_URL = "https://api.kraken.com/0/public"
 # Kalıcı disk eklendiğinde Render Environment içine DB_PATH=/var/data/trader.db yazılabilir.
 DB_PATH = os.getenv("DB_PATH", "/tmp/trader.db")
 SCAN_SECONDS = 60
-LEVERAGE = 10.0
+LEVERAGE = 5.0
 MARGIN_FRACTION = 0.05
 STOP_LOSS_PCT = 2.0
 TAKE_PROFIT_PCT = 4.0
@@ -157,7 +157,7 @@ def run_scan():
                     (coin,pair,signal,price,qty,margin,datetime.now(timezone.utc).isoformat()))
                 c.execute("INSERT INTO trades(at,action,coin,side,price,qty,margin,pnl,reason) VALUES(?,?,?,?,?,?,?,?,?)",
                     (datetime.now(timezone.utc).isoformat(),"OPEN",coin,signal,price,qty,margin,0.0,
-                     "10x kaldıraç; sermayenin %5'i teminat"))
+                     "5x kaldıraç; sermayenin %5'i teminat"))
         c.execute("UPDATE account SET last_scan=? WHERE id=1",
                   (datetime.now(timezone.utc).isoformat(),))
     return results, errors
@@ -185,7 +185,7 @@ init_db()
 start_worker()
 
 st.title("📈 AI TRADER PRO — SANAL VADELİ")
-st.warning("Bu sürüm yalnızca SANAL vadeli işlem simülasyonudur. Gerçek borsaya emir göndermez. 10x kaldıraç yüksek risklidir; sonuçlar komisyon/funding içermeyen yaklaşık simülasyondur.")
+st.warning("Bu sürüm yalnızca SANAL vadeli işlem simülasyonudur. Gerçek borsaya emir göndermez. 5x kaldıraç kullanılır; sonuçlar komisyon/funding içermeyen yaklaşık simülasyondur.")
 with db() as c:
     account = c.execute("SELECT * FROM account WHERE id=1").fetchone()
     positions = [dict(x) for x in c.execute("SELECT * FROM positions ORDER BY coin").fetchall()]
@@ -198,29 +198,46 @@ if bool(enabled) != bool(account["enabled"]):
         c.execute("UPDATE account SET enabled=? WHERE id=1", (int(enabled),))
     st.rerun()
 
+# Gerçekleşmiş kâr/zarar yalnızca kapanan işlemlerden; açık işlemler ayrıca anlık hesaplanır.
+with db() as c:
+    realized_pnl = c.execute(
+        "SELECT COALESCE(SUM(pnl),0) AS total FROM trades WHERE action='CLOSE'"
+    ).fetchone()["total"]
+
 m1,m2,m3,m4 = st.columns(4)
-m1.metric("Sanal bakiye", f"${account['cash']:,.2f}")
-m2.metric("Kaldıraç", "10x")
-m3.metric("İşlem teminatı", "%5")
+m1.metric("Kullanılabilir sanal bakiye", f"${account['cash']:,.2f}")
+m2.metric("Gerçekleşmiş K/Z", f"${realized_pnl:,.2f}")
+m3.metric("Kaldıraç", "5x")
 m4.metric("Son arka plan taraması", account["last_scan"][:19].replace("T"," ") if account["last_scan"] != "-" else "Henüz yok")
 
-st.caption("Bot, Render web servisi çalıştığı sürece tarama yapar; tarayıcıyı kapatmanız gerekmez. Render servisi uykuya alınır/yeniden başlatılırsa tarama durur. Kalıcı disk önerilir.")
+st.caption("Açık işlemlerin K/Z'si henüz gerçekleşmemiştir; pozisyon kapandığında gerçekleşmiş K/Z'ye eklenir. Değerler komisyon ve funding hariç tahminidir.")
+st.caption("Bot, Render web servisi çalıştığı sürece tarama yapar; tarayıcıyı kapatmanız gerekmez. Render servisi yeniden başlatılırsa /tmp veritabanı sıfırlanabilir.")
 st.subheader("Açık sanal pozisyonlar")
+open_rows = []
+unrealized_pnl = 0.0
+used_margin = 0.0
 if positions:
-    rows = []
     for p in positions:
         try:
             price, _, _, _ = signal_for(p["pair"])
             direction = 1 if p["side"] == "LONG" else -1
             pnl = (price/p["entry"]-1)*direction*p["qty"]
-            rows.append({"Coin":p["coin"],"Yön":p["side"],"Giriş":p["entry"],
-                         "Anlık":price,"Kaldıraç":"10x","Teminat":p["margin"],
-                         "Tahmini K/Z":pnl,"K/Z % (teminat)":pnl/p["margin"]*100})
+            unrealized_pnl += pnl
+            used_margin += p["margin"]
+            open_rows.append({"Coin":p["coin"],"Yön":p["side"],"Giriş":round(p["entry"],8),
+                         "Anlık fiyat":round(price,8),"Miktar":round(p["qty"],8),
+                         "Teminat ($)":round(p["margin"],2),"Açık K/Z ($)":round(pnl,4),
+                         "Teminat getirisi (%)":round(pnl/p["margin"]*100,4) if p["margin"] else 0})
         except Exception as e:
-            rows.append({"Coin":p["coin"],"Yön":p["side"],"Hata":str(e)})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            open_rows.append({"Coin":p["coin"],"Yön":p["side"],"Fiyat/KZ hatası":str(e)})
+    st.dataframe(pd.DataFrame(open_rows), use_container_width=True, hide_index=True)
 else:
     st.info("Açık pozisyon yok. Bot etkinleştirilirse sinyale göre sanal pozisyon açabilir.")
+
+k1,k2,k3 = st.columns(3)
+k1.metric("Açık pozisyonların toplam K/Z'si", f"${unrealized_pnl:,.4f}")
+k2.metric("Ayrılmış teminat", f"${used_margin:,.2f}")
+k3.metric("Toplam özsermaye (tahmini)", f"${account['cash'] + used_margin + unrealized_pnl:,.2f}")
 
 st.subheader("Piyasa tarayıcı")
 if st.button("Piyasayı şimdi tara"):
@@ -241,7 +258,7 @@ for coin, pair in COINS.items():
         market.append({"Coin":coin,"Parite":pair,"Hata":str(e)})
 st.dataframe(pd.DataFrame(market), use_container_width=True, hide_index=True)
 
-st.subheader("Son sanal işlemler")
+st.subheader("İşlem geçmişi (OPEN = açılış, CLOSE = kapanış; gerçekleşmiş K/Z CLOSE satırındadır)")
 if trades:
     st.dataframe(pd.DataFrame(trades), use_container_width=True, hide_index=True)
 else:
