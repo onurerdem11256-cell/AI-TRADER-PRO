@@ -180,8 +180,8 @@ if st.session_state.auto_trade:
             del st.session_state.positions[coin]
             events.append(f"{coin}: {reason}; ${proceeds:,.2f} nakde döndü.")
 
-    # Bir coinde tek açık pozisyon. Her AL işlemi başlangıç sermayesinin %10'u.
-    budget = st.session_state.initial_capital * 0.10
+    # Bir coinde tek açık pozisyon. Her AL işlemi başlangıç sermayesinin %01'i.
+    budget = st.session_state.initial_capital * 0.01
     for coin, price in prices.items():
         if coin in st.session_state.positions or signals.get(coin) != "AL":
             continue
@@ -194,7 +194,7 @@ if st.session_state.auto_trade:
         st.session_state.history.append({
             "Zaman":time.strftime("%Y-%m-%d %H:%M:%S"), "İşlem":"OTOMATİK AL",
             "Coin":coin, "Fiyat":price, "Miktar":units, "Tutar":investment,
-            "Sebep":"AL sinyali; sermayenin %10'u", "Getiri %":0.0})
+            "Sebep":"AL sinyali; sermayenin %1'i", "Getiri %":0.0})
         events.append(f"{coin}: ${investment:,.2f} tutarında sanal alındı.")
     for event in events:
         st.success(event)
