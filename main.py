@@ -290,13 +290,55 @@ take_percent = st.number_input(
     step=0.5
 )
 
-if st.button("🔄 Piyasayı Analiz Et", use_container_width=True):
+# -------------------------------
+# OTOMATİK PİYASA YENİLEME
+# -------------------------------
+
+st.subheader("⏱️ Otomatik Piyasa Takibi")
+
+auto_refresh = st.toggle(
+    "Otomatik yenileme aktif",
+    value=True
+)
+
+refresh_seconds = st.selectbox(
+    "Yenileme aralığı",
+    [30, 60, 120, 300],
+    index=1,
+    format_func=lambda x: f"{x} saniye"
+)
+
+refresh_count = None
+
+if auto_refresh:
+    refresh_count = st_autorefresh(
+        interval=refresh_seconds * 1000,
+        key="market_auto_refresh"
+    )
+
+manual_refresh = st.button(
+    "🔄 Piyasayı Analiz Et",
+    use_container_width=True
+)
+
+if "last_refresh_count" not in st.session_state:
+    st.session_state.last_refresh_count = None
+
+auto_due = (
+    auto_refresh
+    and refresh_count != st.session_state.last_refresh_count
+)
+
+if manual_refresh or auto_due:
+
+    if auto_due:
+        st.session_state.last_refresh_count = refresh_count
+
     try:
         pair = COINS[coin_name]
-        df = get_data.clear.__self__ if False else get_data(pair)
+        df = get_data(pair)
 
-        # Kraken son satırda açık mum döndürebilir.
-        # Son tamamlanmış mumu analiz et.
+        # Son tamamlanmış mum
         row = df.iloc[-2]
 
         st.session_state.market_data[coin_name] = {
@@ -309,22 +351,21 @@ if st.button("🔄 Piyasayı Analiz Et", use_container_width=True):
             timezone.utc
         ).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        # Açık pozisyon için risk kontrolü
+        # Açık pozisyonların risk kontrolü
         prices = {
             name: data["price"]
             for name, data in st.session_state.market_data.items()
         }
+
         check_risk_limits(prices)
 
         st.session_state["df_" + coin_name] = df
 
     except Exception as e:
         st.error(
-            "Piyasa verisi alınamadı. Biraz sonra tekrar dene. "
+            "Piyasa verisi alınamadı. "
             f"Teknik detay: {e}"
         )
-
-market = st.session_state.market_data.get(coin_name)
 
 if market:
     price = market["price"]
