@@ -366,6 +366,7 @@ if manual_refresh or auto_due:
             "Piyasa verisi alınamadı. "
             f"Teknik detay: {e}"
         )
+market = st.session_state.market_data.get(coin_name)
 
 if market:
     price = market["price"]
