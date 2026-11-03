@@ -12,7 +12,11 @@ import streamlit as st
 st.set_page_config(page_title="AI TRADER PRO", page_icon="📈", layout="wide")
 
 BASE_URL = "https://api.kraken.com/0/public"
-DB_PATH = os.getenv("DB_PATH", "/var/data/trader.db")
+# Kalıcı disk tanımlı değilse /var/data izin hatası verir.
+# /tmp varsayılanı uygulamanın açılmasını sağlar; Render yeniden başlarsa
+# bu klasördeki simülasyon verileri silinebilir.
+# Kalıcı disk eklendiğinde Render Environment içine DB_PATH=/var/data/trader.db yazılabilir.
+DB_PATH = os.getenv("DB_PATH", "/tmp/trader.db")
 SCAN_SECONDS = 60
 LEVERAGE = 10.0
 MARGIN_FRACTION = 0.05
@@ -51,7 +55,6 @@ def init_db():
             coin TEXT, side TEXT, price REAL, qty REAL, margin REAL,
             pnl REAL, reason TEXT)""")
 
-@st.cache_data(ttl=45, show_spinner=False)
 def get_ohlc(pair, interval=15):
     r = requests.get(BASE_URL + "/OHLC",
         params={"pair": pair, "interval": interval}, timeout=15,
@@ -139,7 +142,12 @@ def run_scan():
                 exists = c.execute("SELECT 1 FROM positions WHERE coin=?", (coin,)).fetchone()
                 if exists or signal not in ("LONG","SHORT"):
                     continue
-                margin = min(margin_per_trade, account["cash"])
+                # Her yeni pozisyon öncesinde güncel bakiyeyi oku.
+                # Böylece aynı taramada kullanılabilir teminattan fazlası ayrılmaz.
+                current_cash = c.execute(
+                    "SELECT cash FROM account WHERE id=1"
+                ).fetchone()["cash"]
+                margin = min(margin_per_trade, current_cash)
                 if margin < 10:
                     break
                 notional = margin * LEVERAGE
@@ -216,7 +224,6 @@ else:
 
 st.subheader("Piyasa tarayıcı")
 if st.button("Piyasayı şimdi tara"):
-    st.cache_data.clear()
     with st.spinner("Coinler taranıyor..."):
         scan_results, scan_errors = run_scan()
     st.success(f"{len(scan_results)} coin verisi alındı.")
