@@ -1,278 +1,260 @@
-import streamlit as st
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pandas as pd
 import requests
-from datetime import datetime, timezone
-from streamlit_autorefresh import st_autorefresh
+import streamlit as st
 
-st.set_page_config(page_title="AI TRADER PRO", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="AI TRADER PRO", page_icon="📈", layout="wide")
 
-START_BALANCE = 10000.0
+BASE_URL = "https://api.kraken.com/0/public"
 COINS = {
-    "Bitcoin (BTC)": "XBTUSD",
-    "Ethereum (ETH)": "ETHUSD",
-    "Solana (SOL)": "SOLUSD",
-    "Ripple (XRP)": "XRPUSD",
+    "Bitcoin": "XBTUSD",
+    "Ethereum": "ETHUSD",
+    "Solana": "SOLUSD",
+    "XRP": "XRPUSD",
+    "BNB": "BNBUSD",
+    "Cardano": "ADAUSD",
+    "Dogecoin": "XDGUSD",
+    "Avalanche": "AVAXUSD",
+    "Chainlink": "LINKUSD",
+    "Polkadot": "DOTUSD",
+    "Litecoin": "LTCUSD",
+    "Bitcoin Cash": "BCHUSD",
+    "Stellar": "XLMUSD",
+    "Cosmos": "ATOMUSD",
+    "Uniswap": "UNIUSD",
+    "Ethereum Classic": "ETCUSD",
+    "Aave": "AAVEUSD",
+    "NEAR": "NEARUSD",
+    "Sui": "SUIUSD",
+    "TRON": "TRXUSD",
 }
-for key, default in {
-    "balance": START_BALANCE, "trades": [], "positions": {},
-    "market_data": {}, "last_update": None, "last_refresh_count": None
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default.copy() if isinstance(default, (dict, list)) else default
 
-
-@st.cache_data(ttl=20, show_spinner=False)
-def get_ohlc(pair):
-    r = requests.get(
-        "https://api.kraken.com/0/public/OHLC",
-        params={"pair": pair, "interval": 15},
-        headers={"User-Agent": "AI-TRADER-PRO"}, timeout=20
+@st.cache_data(ttl=60, show_spinner=False)
+def get_ohlc(pair: str, interval: int = 15):
+    response = requests.get(
+        f"{BASE_URL}/OHLC",
+        params={"pair": pair, "interval": interval},
+        timeout=15,
+        headers={"User-Agent": "AI-Trader-Pro/1.0"},
     )
-    r.raise_for_status()
-    data = r.json()
-    if data.get("error"):
-        raise ValueError(", ".join(data["error"]))
-    result = data.get("result", {})
-    pair_key = next((k for k in result if k != "last"), None)
-    if not pair_key:
-        raise ValueError("Mum verisi bulunamadı.")
-    df = pd.DataFrame(result[pair_key], columns=[
-        "time", "open", "high", "low", "close", "vwap", "volume", "count"
-    ])
-    df["time"] = pd.to_datetime(df["time"].astype(float), unit="s", utc=True)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise ValueError(", ".join(payload["error"]))
+    result = payload.get("result", {})
+    data_key = next((key for key in result if key != "last"), None)
+    if not data_key:
+        raise ValueError("Kraken veri döndürmedi")
+    rows = result[data_key]
+    df = pd.DataFrame(
+        rows,
+        columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"],
+    )
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["close"]).reset_index(drop=True)
-    if len(df) < 55:
-        raise ValueError("Teknik analiz için yeterli mum verisi yok.")
+    return df.dropna().reset_index(drop=True)
 
-    df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
-    delta = df["close"].diff()
-    gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    df["RSI"] = 100 - (100 / (1 + rs))
-    df.loc[(avg_loss == 0) & (avg_gain > 0), "RSI"] = 100
-    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["close"].ewm(span=26, adjust=False).mean()
-    df["MACD"] = ema12 - ema26
-    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    return df
+def indicators(df):
+    d = df.copy()
+    d["ema20"] = d["close"].ewm(span=20, adjust=False).mean()
+    d["ema50"] = d["close"].ewm(span=50, adjust=False).mean()
+    delta = d["close"].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, 1e-12)
+    d["rsi"] = 100 - (100 / (1 + rs))
+    ema12 = d["close"].ewm(span=12, adjust=False).mean()
+    ema26 = d["close"].ewm(span=26, adjust=False).mean()
+    d["macd"] = ema12 - ema26
+    d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
+    return d
 
+def analyze_coin(name, pair, interval):
+    try:
+        df = indicators(get_ohlc(pair, interval))
+        if len(df) < 55:
+            raise ValueError("Yeterli mum verisi yok")
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        score = 0
+        reasons = []
+        if last["close"] > last["ema20"]:
+            score += 1
+            reasons.append("Fiyat EMA20 üzerinde")
+        else:
+            score -= 1
+            reasons.append("Fiyat EMA20 altında")
+        if last["ema20"] > last["ema50"]:
+            score += 1
+            reasons.append("EMA20 > EMA50")
+        else:
+            score -= 1
+            reasons.append("EMA20 < EMA50")
+        if last["macd"] > last["macd_signal"]:
+            score += 1
+            reasons.append("MACD pozitif kesişimde")
+        else:
+            score -= 1
+            reasons.append("MACD negatif kesişimde")
+        if last["rsi"] < 35:
+            score += 1
+            reasons.append("RSI aşırı satım bölgesinde")
+        elif last["rsi"] > 70:
+            score -= 1
+            reasons.append("RSI aşırı alım bölgesinde")
+        if score >= 2:
+            signal = "AL"
+        elif score <= -2:
+            signal = "SAT"
+        else:
+            signal = "BEKLE"
+        change = ((last["close"] / prev["close"]) - 1) * 100
+        return {
+            "Coin": name,
+            "Parite": pair,
+            "Fiyat (USD)": float(last["close"]),
+            "24s değil / son mum %": float(change),
+            "RSI": float(last["rsi"]),
+            "Skor": score,
+            "Sinyal": signal,
+            "Açıklama": " • ".join(reasons),
+            "updated": int(time.time()),
+        }
+    except Exception as exc:
+        return {"Coin": name, "Parite": pair, "Hata": str(exc)}
 
-@st.cache_data(ttl=10, show_spinner=False)
-def get_live_price(pair):
-    r = requests.get(
-        "https://api.kraken.com/0/public/Ticker",
-        params={"pair": pair},
-        headers={"User-Agent": "AI-TRADER-PRO"}, timeout=15
-    )
-    r.raise_for_status()
-    data = r.json()
-    if data.get("error"):
-        raise ValueError(", ".join(data["error"]))
-    result = data.get("result", {})
-    if not result:
-        raise ValueError("Güncel fiyat bulunamadı.")
-    return float(next(iter(result.values()))["c"][0])
-
-
-def get_signal(row):
-    if pd.isna(row["RSI"]) or pd.isna(row["MACD_Signal"]):
-        return "VERİ YETERSİZ"
-    if row["EMA20"] > row["EMA50"] and row["MACD"] > row["MACD_Signal"] and row["RSI"] < 70:
-        return "ALIM ADAYI"
-    if row["EMA20"] < row["EMA50"] and row["MACD"] < row["MACD_Signal"] and row["RSI"] > 30:
-        return "SATIŞ ADAYI"
-    return "BEKLE"
-
-
-def close_position(coin, price, reason):
-    pos = st.session_state.positions.get(coin)
-    if not pos:
-        return
-    proceeds = pos["quantity"] * price
-    pnl = proceeds - pos["cost"]
-    st.session_state.balance += proceeds
-    st.session_state.trades.append({
-        "Zaman": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "Coin": coin, "İşlem": "SANAL SATIŞ",
-        "Fiyat (USD)": round(price, 8), "Miktar": round(pos["quantity"], 8),
-        "Tutar (USDT)": round(proceeds, 2), "Kâr/Zarar (USDT)": round(pnl, 2),
-        "Açıklama": reason
-    })
-    del st.session_state.positions[coin]
-
-
-def refresh_markets():
-    errors = []
-    for name, pair in COINS.items():
-        try:
-            df = get_ohlc(pair)
-            completed = df.iloc[-2]  # tamamlanmış son 15 dakikalık mum
-            price = get_live_price(pair)  # güncel işlem fiyatı
-            st.session_state.market_data[name] = {
-                "price": price, "signal": get_signal(completed),
-                "rsi": float(completed["RSI"]) if pd.notna(completed["RSI"]) else None,
-                "macd": float(completed["MACD"]),
-                "macd_signal": float(completed["MACD_Signal"]),
-                "candle_time": str(completed["time"])
-            }
-            st.session_state["df_" + name] = df
-        except Exception as exc:
-            errors.append(f"{name}: {exc}")
-
-    # Risk kontrolleri yalnızca uygulama çalışırken, veri yenilenince yapılır.
-    for name, pos in list(st.session_state.positions.items()):
-        market = st.session_state.market_data.get(name)
-        if not market:
-            continue
-        price = market["price"]
-        if price <= pos["stop_loss"]:
-            close_position(name, price, "Otomatik stop-loss")
-        elif price >= pos["take_profit"]:
-            close_position(name, price, "Otomatik take-profit")
-    st.session_state.last_update = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    return errors
-
-
-st.title("🚀 AI TRADER PRO")
-st.subheader("Çoklu Coin Takibi • Teknik Analiz • Sanal İşlem")
-st.info("Demo modudur. Gerçek emir gönderilmez. Sinyaller kesin tahmin değildir.")
+st.title("📈 AI TRADER PRO")
+st.caption("Çoklu kripto tarayıcı • Kraken spot verileri • Teknik analiz sinyalleri")
+st.warning("Sinyaller teknik göstergelere dayalı otomatik analizdir; yatırım tavsiyesi değildir. Bu uygulama gerçek alım-satım emri göndermez.")
 
 with st.sidebar:
-    st.header("⚙️ Takip Ayarları")
-    auto = st.toggle("Otomatik piyasa takibi", value=True)
-    seconds = st.selectbox("Yenileme aralığı", [30, 60, 120, 300], index=1,
-                           format_func=lambda x: f"{x} saniye")
-
-count = st_autorefresh(interval=seconds * 1000, key="multi_coin_refresh") if auto else None
-manual = st.button("🔄 Tüm Coinleri Şimdi Güncelle", use_container_width=True)
-auto_due = auto and count != st.session_state.last_refresh_count
-if manual or auto_due or not st.session_state.market_data:
-    if auto_due:
-        st.session_state.last_refresh_count = count
-    with st.spinner("BTC, ETH, SOL ve XRP verileri alınıyor..."):
-        errors = refresh_markets()
-    if errors:
-        st.warning("Bazı coinlerin verisi alınamadı:\n\n" + "\n".join(errors))
-
-# Portföy özeti
-market_value = 0.0
-unrealized = 0.0
-for name, pos in st.session_state.positions.items():
-    current = st.session_state.market_data.get(name, {}).get("price", pos["entry_price"])
-    market_value += pos["quantity"] * current
-    unrealized += (current - pos["entry_price"]) * pos["quantity"]
-realized = sum(t["Kâr/Zarar (USDT)"] for t in st.session_state.trades if t["İşlem"] == "SANAL SATIŞ")
-equity = st.session_state.balance + market_value
-
-a, b, c, d = st.columns(4)
-a.metric("Kullanılabilir Bakiye", f'{st.session_state.balance:,.2f} USDT')
-b.metric("Toplam Portföy", f"{equity:,.2f} USDT")
-c.metric("Açık Pozisyon", str(len(st.session_state.positions)))
-d.metric("Açık Pozisyon K/Z", f"{unrealized:+,.2f} USDT")
-st.caption(f"Gerçekleşmiş K/Z: {realized:+,.2f} USDT | Son güncelleme: {st.session_state.last_update or 'Henüz yok'}")
-
-st.divider()
-st.header("📡 Çoklu Coin Piyasası")
-table = []
-for name in COINS:
-    item = st.session_state.market_data.get(name)
-    if item:
-        table.append({
-            "Coin": name, "Güncel fiyat (USD)": round(item["price"], 4),
-            "Sinyal": item["signal"],
-            "RSI": round(item["rsi"], 2) if item["rsi"] is not None else "N/A",
-            "MACD": round(item["macd"], 4),
-            "Son tamamlanmış mum": item["candle_time"]
-        })
-if table:
-    st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
-else:
-    st.warning("Piyasa verisi henüz yüklenmedi.")
-
-st.divider()
-st.header("🛒 Sanal İşlem")
-coin = st.selectbox("İşlem yapılacak coin", list(COINS.keys()))
-market = st.session_state.market_data.get(coin)
-stop_pct = st.number_input("Stop-loss (%)", min_value=0.5, max_value=50.0, value=3.0, step=0.5)
-take_pct = st.number_input("Take-profit (%)", min_value=0.5, max_value=100.0, value=6.0, step=0.5)
-amount = st.number_input("Sanal alım tutarı (USDT)", min_value=10.0, max_value=10000.0, value=100.0, step=10.0)
-
-if market:
-    price = market["price"]
-    st.metric(f"{coin} güncel fiyatı", f"{price:,.4f} USD")
-    pos = st.session_state.positions.get(coin)
-    if pos:
-        value = pos["quantity"] * price
-        pnl = value - pos["cost"]
-        x, y, z = st.columns(3)
-        x.metric("Giriş fiyatı", f'{pos["entry_price"]:,.4f} USD')
-        y.metric("Pozisyon değeri", f"{value:,.2f} USDT")
-        z.metric("Pozisyon K/Z", f"{pnl:+,.2f} USDT")
-        st.caption(f'Stop-loss: {pos["stop_loss"]:,.4f} USD | Take-profit: {pos["take_profit"]:,.4f} USD')
-        if st.button("🔴 Pozisyonu Sanal Kapat", use_container_width=True):
-            close_position(coin, price, "Manuel sanal satış")
-            st.success("Pozisyon kapatıldı.")
-            st.rerun()
-    elif st.button("🟢 Sanal AL", use_container_width=True):
-        if amount > st.session_state.balance:
-            st.error("Yetersiz sanal bakiye.")
-        elif price <= 0:
-            st.error("Geçersiz fiyat.")
-        else:
-            qty = amount / price
-            st.session_state.balance -= amount
-            st.session_state.positions[coin] = {
-                "entry_price": price, "quantity": qty, "cost": amount,
-                "stop_loss": price * (1 - stop_pct / 100),
-                "take_profit": price * (1 + take_pct / 100)
-            }
-            st.session_state.trades.append({
-                "Zaman": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "Coin": coin, "İşlem": "SANAL ALIM", "Fiyat (USD)": round(price, 8),
-                "Miktar": round(qty, 8), "Tutar (USDT)": round(amount, 2),
-                "Kâr/Zarar (USDT)": 0.0, "Açıklama": "Sanal alım"
-            })
-            st.success(f"Sanal alım tamamlandı: {qty:.8f} adet.")
-            st.rerun()
-else:
-    st.info("İşlem için önce piyasa verilerini güncelle.")
-
-st.divider()
-st.header("📂 Açık Pozisyonlar")
-if st.session_state.positions:
-    positions_table = []
-    for name, pos in st.session_state.positions.items():
-        current = st.session_state.market_data.get(name, {}).get("price", pos["entry_price"])
-        value = pos["quantity"] * current
-        positions_table.append({
-            "Coin": name, "Giriş": round(pos["entry_price"], 6),
-            "Güncel": round(current, 6), "Miktar": round(pos["quantity"], 8),
-            "Pozisyon değeri": round(value, 2),
-            "Stop-loss": round(pos["stop_loss"], 6),
-            "Take-profit": round(pos["take_profit"], 6),
-            "K/Z (USDT)": round(value - pos["cost"], 2)
-        })
-    st.dataframe(pd.DataFrame(positions_table), use_container_width=True, hide_index=True)
-else:
-    st.write("Açık sanal pozisyon bulunmuyor.")
-
-st.divider()
-st.header("📜 İşlem Geçmişi")
-if st.session_state.trades:
-    st.dataframe(pd.DataFrame(st.session_state.trades[::-1]), use_container_width=True, hide_index=True)
-    if st.button("🗑️ İşlem geçmişini temizle"):
-        st.session_state.trades = []
+    st.header("Tarama ayarları")
+    interval_label = st.selectbox("Zaman aralığı", ["5 dakika", "15 dakika", "1 saat", "4 saat", "1 gün"], index=1)
+    interval_map = {"5 dakika": 5, "15 dakika": 15, "1 saat": 60, "4 saat": 240, "1 gün": 1440}
+    interval = interval_map[interval_label]
+    selected_names = st.multiselect("Taranacak coinler", list(COINS.keys()), default=list(COINS.keys()))
+    if st.button("🔄 Verileri yenile", use_container_width=True):
+        st.cache_data.clear()
         st.rerun()
-else:
-    st.write("Henüz sanal işlem yapılmadı.")
+    st.caption("Veriler 60 saniyede bir önbellekten yenilenir.")
 
-st.caption(
-    "AI TRADER PRO | Eğitim ve simülasyon amaçlıdır; yatırım tavsiyesi değildir. "
-    "Stop-loss/take-profit uygulama çalışırken ve veri yenilendiğinde kontrol edilir. "
-    "Render oturumu yeniden başlatılırsa sanal bakiye ve işlem geçmişi sıfırlanabilir."
-)
+if not selected_names:
+    st.info("Tarama için en az bir coin seç.")
+    st.stop()
+
+rows = []
+progress = st.progress(0, text="Coinler taranıyor...")
+with ThreadPoolExecutor(max_workers=5) as executor:
+    futures = {
+        executor.submit(analyze_coin, name, COINS[name], interval): name
+        for name in selected_names
+    }
+    completed = 0
+    for future in as_completed(futures):
+        rows.append(future.result())
+        completed += 1
+        progress.progress(completed / len(futures), text=f"Tarama: {completed}/{len(futures)}")
+progress.empty()
+
+valid = [r for r in rows if "Hata" not in r]
+errors = [r for r in rows if "Hata" in r]
+if not valid:
+    st.error("Coin verileri alınamadı. Kraken bağlantısını veya seçilen pariteleri kontrol et.")
+    for item in errors:
+        st.write(f"**{item['Coin']}**: {item['Hata']}")
+    st.stop()
+
+df = pd.DataFrame(valid).sort_values(["Skor", "Coin"], ascending=[False, True]).reset_index(drop=True)
+buy_count = int((df["Sinyal"] == "AL").sum())
+sell_count = int((df["Sinyal"] == "SAT").sum())
+wait_count = int((df["Sinyal"] == "BEKLE").sum())
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Taranan coin", len(valid))
+c2.metric("AL sinyali", buy_count)
+c3.metric("SAT sinyali", sell_count)
+c4.metric("BEKLE", wait_count)
+
+st.subheader("🔎 Piyasa tarama sonuçları")
+signal_filter = st.multiselect("Sinyal filtresi", ["AL", "BEKLE", "SAT"], default=["AL", "BEKLE", "SAT"])
+view = df[df["Sinyal"].isin(signal_filter)].copy()
+display = view[["Coin", "Parite", "Fiyat (USD)", "Son mum %", "RSI", "Skor", "Sinyal"]].copy()
+display["Fiyat (USD)"] = display["Fiyat (USD)"].map(lambda x: f"${x:,.6f}".rstrip("0").rstrip("."))
+display["Son mum %"] = display["Son mum %"].map(lambda x: f"{x:+.2f}%")
+display["RSI"] = display["RSI"].map(lambda x: f"{x:.1f}")
+st.dataframe(display, use_container_width=True, hide_index=True)
+
+st.subheader("🎯 Coin detayları")
+coin_choice = st.selectbox("Detayını görmek istediğin coin", [r["Coin"] for r in valid])
+detail = next(r for r in valid if r["Coin"] == coin_choice)
+st.write(f"**Sinyal: {detail['Sinyal']}**  |  **Skor: {detail['Skor']}/4**  |  **RSI: {detail['RSI']:.1f}**")
+st.write(detail["Açıklama"])
+st.metric("Son fiyat", f"${detail['Fiyat (USD)']:,.6f}".rstrip("0").rstrip("."))
+
+st.subheader("🧪 Sanal portföy")
+if "cash" not in st.session_state:
+    st.session_state.cash = 10000.0
+if "positions" not in st.session_state:
+    st.session_state.positions = {}
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+prices = {r["Coin"]: r["Fiyat (USD)"] for r in valid}
+trade_coin = st.selectbox("İşlem yapılacak coin", list(prices.keys()), key="trade_coin")
+amount = st.number_input("İşlem tutarı (USD)", min_value=10.0, max_value=100000.0, value=100.0, step=10.0)
+buy_col, sell_col = st.columns(2)
+
+with buy_col:
+    if st.button("🟢 Sanal AL", use_container_width=True):
+        price = prices[trade_coin]
+        if amount <= st.session_state.cash:
+            units = amount / price
+            pos = st.session_state.positions.get(trade_coin, 0.0)
+            st.session_state.positions[trade_coin] = pos + units
+            st.session_state.cash -= amount
+            st.session_state.history.append({"İşlem": "AL", "Coin": trade_coin, "Miktar": units, "Fiyat": price, "Tutar": amount})
+            st.success("Sanal alım yapıldı.")
+        else:
+            st.error("Sanal nakit bakiyesi yetersiz.")
+
+with sell_col:
+    if st.button("🔴 Sanal SAT", use_container_width=True):
+        price = prices[trade_coin]
+        units_to_sell = amount / price
+        owned = st.session_state.positions.get(trade_coin, 0.0)
+        if units_to_sell <= owned:
+            st.session_state.positions[trade_coin] = owned - units_to_sell
+            st.session_state.cash += amount
+            st.session_state.history.append({"İşlem": "SAT", "Coin": trade_coin, "Miktar": units_to_sell, "Fiyat": price, "Tutar": amount})
+            st.success("Sanal satış yapıldı.")
+        else:
+            st.error("Bu tutarda satmak için yeterli coin yok.")
+
+portfolio_value = sum(st.session_state.positions.get(name, 0.0) * price for name, price in prices.items())
+p1, p2, p3 = st.columns(3)
+p1.metric("Sanal nakit", f"${st.session_state.cash:,.2f}")
+p2.metric("Açık pozisyon değeri", f"${portfolio_value:,.2f}")
+p3.metric("Toplam portföy", f"${st.session_state.cash + portfolio_value:,.2f}")
+
+positions_rows = [
+    {"Coin": name, "Miktar": units, "Anlık değer (USD)": units * prices[name]}
+    for name, units in st.session_state.positions.items()
+    if units > 0 and name in prices
+]
+if positions_rows:
+    st.dataframe(pd.DataFrame(positions_rows), use_container_width=True, hide_index=True)
+else:
+    st.caption("Henüz açık sanal pozisyon yok.")
+
+if st.session_state.history:
+    with st.expander("Sanal işlem geçmişi"):
+        st.dataframe(pd.DataFrame(st.session_state.history), use_container_width=True, hide_index=True)
+
+if errors:
+    with st.expander(f"Verisi alınamayan coinler ({len(errors)})"):
+        for item in errors:
+            st.write(f"**{item['Coin']}** — {item['Hata']}")
+
+st.caption("Not: Son mum değişimi gösterilir; 24 saatlik değişim değildir. Sanal portföy uygulama oturumu sıfırlanınca silinebilir.")
