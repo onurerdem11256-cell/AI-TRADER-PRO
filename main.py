@@ -1,286 +1,360 @@
 import os
 import time
+import hmac
+import hashlib
 import sqlite3
 import threading
+from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlencode
 
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="AI TRADER PRO", page_icon="📈", layout="wide")
+# AI TRADER PRO — Binance USDⓈ-M Futures
+# Gerçek emir gönderimi varsayılan olarak KAPALIDIR.
+# Açmak için Render'da ALLOW_LIVE_TRADING=true ve API anahtarları gerekir.
 
-BASE_URL = "https://api.kraken.com/0/public"
-# Kalıcı disk tanımlı değilse /var/data izin hatası verir.
-# /tmp varsayılanı uygulamanın açılmasını sağlar; Render yeniden başlarsa
-# bu klasördeki simülasyon verileri silinebilir.
-# Kalıcı disk eklendiğinde Render Environment içine DB_PATH=/var/data/trader.db yazılabilir.
-DB_PATH = os.getenv("DB_PATH", "/tmp/trader.db")
-SCAN_SECONDS = 60
-LEVERAGE = 5.0
+st.set_page_config(page_title="AI TRADER PRO | Binance Futures", page_icon="📈", layout="wide")
+
+BASE_URL = os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com").rstrip("/")
+API_KEY = os.getenv("BINANCE_API_KEY", "")
+API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+ALLOW_LIVE = os.getenv("ALLOW_LIVE_TRADING", "false").lower() == "true"
+DB_PATH = os.getenv("DB_PATH", "/tmp/ai_trader_binance.db")
+
+LEVERAGE = 5
 MARGIN_FRACTION = 0.05
-STOP_LOSS_PCT = 2.0
-TAKE_PROFIT_PCT = 4.0
+STOP_LOSS_PCT = 0.02
+TAKE_PROFIT_PCT = 0.04
+SCAN_SECONDS = 60
+MAX_OPEN_POSITIONS = 1
+MAX_DAILY_LOSS_FRACTION = 0.05
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"]
 
-COINS = {
-    "Bitcoin": "XBTUSD", "Ethereum": "ETHUSD", "Solana": "SOLUSD",
-    "XRP": "XRPUSD", "Cardano": "ADAUSD", "Dogecoin": "XDGUSD",
-    "Avalanche": "AVAXUSD", "Chainlink": "LINKUSD", "Polkadot": "DOTUSD",
-    "Litecoin": "LTCUSD", "Bitcoin Cash": "BCHUSD", "Stellar": "XLMUSD",
-    "Cosmos": "ATOMUSD", "Uniswap": "UNIUSD", "Ethereum Classic": "ETCUSD",
-    "Aave": "AAVEUSD", "NEAR": "NEARUSD", "Sui": "SUIUSD", "TRON": "TRXUSD",
-}
+session = requests.Session()
+session.headers.update({"User-Agent": "AI-TRADER-PRO/4.0"})
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 def db():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=20)
-    conn.row_factory = sqlite3.Row
-    return conn
+    c = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
 
 def init_db():
     with db() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS account (
-            id INTEGER PRIMARY KEY CHECK(id=1), cash REAL NOT NULL,
-            initial_capital REAL NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
-            last_scan TEXT)""")
-        c.execute("""INSERT OR IGNORE INTO account
-            (id,cash,initial_capital,enabled,last_scan) VALUES (1,10000,10000,0,'-')""")
-        c.execute("""CREATE TABLE IF NOT EXISTS positions (
-            coin TEXT PRIMARY KEY, pair TEXT NOT NULL, side TEXT NOT NULL,
-            entry REAL NOT NULL, qty REAL NOT NULL, margin REAL NOT NULL,
-            opened TEXT NOT NULL)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, action TEXT,
-            coin TEXT, side TEXT, price REAL, qty REAL, margin REAL,
-            pnl REAL, reason TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS settings (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            live_enabled INTEGER NOT NULL DEFAULT 0,
+            last_scan TEXT NOT NULL DEFAULT '-',
+            last_message TEXT NOT NULL DEFAULT 'Henüz tarama yapılmadı'
+        )""")
+        c.execute("INSERT OR IGNORE INTO settings(id,live_enabled) VALUES(1,0)")
+        c.execute("""CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, level TEXT,
+            symbol TEXT, message TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS daily (
+            day TEXT PRIMARY KEY, start_equity REAL, realized_pnl REAL DEFAULT 0
+        )""")
 
-def get_ohlc(pair, interval=15):
-    r = requests.get(BASE_URL + "/OHLC",
-        params={"pair": pair, "interval": interval}, timeout=15,
-        headers={"User-Agent": "AI-Trader-Pro/3.0"})
+def log(level, message, symbol=""):
+    with db() as c:
+        c.execute("INSERT INTO events(at,level,symbol,message) VALUES(?,?,?,?)",
+                  (now_iso(), level, symbol, str(message)[:1000]))
+
+def public_get(path, params=None):
+    r = session.get(BASE_URL + path, params=params or {}, timeout=12)
     r.raise_for_status()
-    payload = r.json()
-    if payload.get("error"):
-        raise ValueError(", ".join(payload["error"]))
-    result = payload.get("result", {})
-    key = next((k for k in result if k != "last"), None)
-    if not key:
-        raise ValueError("Kraken veri döndürmedi")
-    d = pd.DataFrame(result[key], columns=[
-        "time","open","high","low","close","vwap","volume","count"])
-    for col in ["open","high","low","close","volume"]:
+    return r.json()
+
+def signed_request(method, path, params=None):
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("Binance API anahtarları Render Environment Variables bölümünde tanımlı değil.")
+    p = dict(params or {})
+    p["timestamp"] = int(time.time() * 1000)
+    p["recvWindow"] = 5000
+    query = urlencode(p, doseq=True)
+    signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    url = f"{BASE_URL}{path}?{query}&signature={signature}"
+    r = session.request(method, url, headers={"X-MBX-APIKEY": API_KEY}, timeout=15)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"msg": r.text}
+    if not r.ok:
+        raise RuntimeError(f"Binance API {r.status_code}: {data}")
+    return data
+
+def get_klines(symbol, interval="15m", limit=120):
+    data = public_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    d = pd.DataFrame(data, columns=[
+        "open_time","open","high","low","close","volume","close_time",
+        "quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"
+    ])
+    for col in ("open","high","low","close","volume"):
         d[col] = pd.to_numeric(d[col], errors="coerce")
     return d.dropna().reset_index(drop=True)
 
-def signal_for(pair):
-    d = get_ohlc(pair, 15).copy()
-    if len(d) < 55:
-        raise ValueError("Yeterli mum verisi yok")
+def make_signal(symbol):
+    d = get_klines(symbol)
+    if len(d) < 60:
+        return None
     d["ema20"] = d.close.ewm(span=20, adjust=False).mean()
     d["ema50"] = d.close.ewm(span=50, adjust=False).mean()
-    delta = d.close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = gain / loss.replace(0, 1e-12)
-    d["rsi"] = 100 - 100/(1+rs)
     macd = d.close.ewm(span=12, adjust=False).mean() - d.close.ewm(span=26, adjust=False).mean()
     d["macd"] = macd
     d["macd_signal"] = macd.ewm(span=9, adjust=False).mean()
-    x = d.iloc[-1]
-
-    # İki yönlü ve simetrik trend filtresi:
-    # LONG için üç yükseliş koşulunun, SHORT için üç düşüş koşulunun
-    # aynı anda sağlanmasını ister. Sırf işlem açmak için yön uydurmaz.
-    bullish = (
-        x.close > x.ema20 and
-        x.ema20 > x.ema50 and
-        x.macd > x.macd_signal
-    )
-    bearish = (
-        x.close < x.ema20 and
-        x.ema20 < x.ema50 and
-        x.macd < x.macd_signal
-    )
-
-    score = (
-        int(x.close > x.ema20) - int(x.close < x.ema20) +
-        int(x.ema20 > x.ema50) - int(x.ema20 < x.ema50) +
-        int(x.macd > x.macd_signal) - int(x.macd < x.macd_signal)
-    )
-    if bullish:
-        sig = "LONG"
-    elif bearish:
-        sig = "SHORT"
+    # Kapanmış son mum kullanılır; oluşmakta olan mumdan sinyal üretmez.
+    x = d.iloc[-2]
+    if x.close > x.ema20 > x.ema50 and x.macd > x.macd_signal:
+        side = "LONG"
+    elif x.close < x.ema20 < x.ema50 and x.macd < x.macd_signal:
+        side = "SHORT"
     else:
-        sig = "WAIT"
+        side = "WAIT"
+    return {"symbol": symbol, "price": float(d.iloc[-1].close), "signal": side,
+            "signal_close": float(x.close), "ema20": float(x.ema20), "ema50": float(x.ema50)}
 
-    return float(x.close), sig, float(x.rsi), score
+def get_exchange_rules(symbol):
+    info = public_get("/fapi/v1/exchangeInfo")
+    item = next((x for x in info["symbols"] if x["symbol"] == symbol), None)
+    if not item or item["status"] != "TRADING":
+        raise RuntimeError(f"{symbol} şu anda işlem göremiyor.")
+    filters = {f["filterType"]: f for f in item["filters"]}
+    lot = filters["LOT_SIZE"]
+    price_filter = filters["PRICE_FILTER"]
+    min_notional = filters.get("MIN_NOTIONAL", {}).get("notional", "5")
+    return Decimal(lot["stepSize"]), Decimal(lot["minQty"]), Decimal(price_filter["tickSize"]), Decimal(str(min_notional))
 
-def close_position(c, coin, pos, price, reason):
-    direction = 1 if pos["side"] == "LONG" else -1
-    pnl = (price / pos["entry"] - 1) * direction * pos["qty"]
-    c.execute("UPDATE account SET cash=cash+? WHERE id=1", (pos["margin"] + pnl,))
-    c.execute("INSERT INTO trades(at,action,coin,side,price,qty,margin,pnl,reason) VALUES(?,?,?,?,?,?,?,?,?)",
-        (datetime.now(timezone.utc).isoformat(), "CLOSE", coin, pos["side"],
-         price, pos["qty"], pos["margin"], pnl, reason))
-    c.execute("DELETE FROM positions WHERE coin=?", (coin,))
+def floor_step(value, step):
+    value, step = Decimal(str(value)), Decimal(str(step))
+    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
 
-def run_scan():
-    init_db()
-    results, errors = {}, {}
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(signal_for, pair): (coin, pair) for coin, pair in COINS.items()}
-        for f in as_completed(futures):
-            coin, pair = futures[f]
-            try:
-                price, signal, rsi, score = f.result()
-                results[coin] = (pair, price, signal, rsi, score)
-            except Exception as e:
-                errors[coin] = str(e)
+def account_info():
+    return signed_request("GET", "/fapi/v2/account")
 
+def position_risk():
+    return signed_request("GET", "/fapi/v2/positionRisk")
+
+def get_mark_price(symbol):
+    return float(public_get("/fapi/v1/premiumIndex", {"symbol": symbol})["markPrice"])
+
+def place_market(symbol, side, qty):
+    return signed_request("POST", "/fapi/v1/order", {
+        "symbol": symbol, "side": side, "type": "MARKET",
+        "quantity": format(qty, "f"), "newOrderRespType": "RESULT"
+    })
+
+def place_protective_order(symbol, side, order_type, trigger_price):
+    # Binance USD-M conditional/algo order endpoint.
+    return signed_request("POST", "/fapi/v1/algoOrder", {
+        "algoType": "CONDITIONAL", "symbol": symbol, "side": side,
+        "type": order_type, "triggerPrice": format(trigger_price, "f"),
+        "closePosition": "true", "workingType": "MARK_PRICE"
+    })
+
+def set_leverage(symbol):
+    return signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
+
+def current_position_for(symbol):
+    rows = position_risk()
+    for p in rows:
+        if p["symbol"] == symbol and abs(float(p["positionAmt"])) > 0:
+            return p
+    return None
+
+def today_realized_pnl():
+    rows = signed_request("GET", "/fapi/v1/income", {"incomeType": "REALIZED_PNL", "startTime": int(time.time()*1000)-86400000, "limit": 1000})
+    return sum(float(x["income"]) for x in rows)
+
+def daily_loss_guard(equity):
+    pnl = today_realized_pnl()
+    max_loss = max(0.0, equity * MAX_DAILY_LOSS_FRACTION)
+    if pnl <= -max_loss:
+        raise RuntimeError(f"Günlük zarar limiti doldu ({pnl:.4f} USDT). Yeni işlem durduruldu.")
+    return pnl
+
+def open_trade(symbol, direction, equity):
+    # direction LONG/SHORT. Risk sizing is based on available USDT balance.
+    acct = account_info()
+    available = float(acct.get("availableBalance", 0))
+    margin = min(available * MARGIN_FRACTION, equity * MARGIN_FRACTION)
+    if margin <= 0:
+        raise RuntimeError("Kullanılabilir USDT teminatı yok.")
+    mark = get_mark_price(symbol)
+    notional = margin * LEVERAGE
+    step, min_qty, tick, min_notional = get_exchange_rules(symbol)
+    raw_qty = Decimal(str(notional / mark))
+    qty = floor_step(raw_qty, step)
+    if qty < min_qty:
+        raise RuntimeError(f"{symbol}: hesaplanan miktar minimum miktarın altında; emir atlanıyor.")
+    actual_notional = float(qty) * mark
+    if Decimal(str(actual_notional)) < min_notional:
+        raise RuntimeError(f"{symbol}: pozisyon büyüklüğü {actual_notional:.4f} USDT; Binance minimum nominali {min_notional} USDT. Emir gönderilmedi.")
+    set_leverage(symbol)
+    order_side = "BUY" if direction == "LONG" else "SELL"
+    order = place_market(symbol, order_side, qty)
+    filled_qty = Decimal(str(order.get("executedQty") or qty))
+    entry = float(order.get("avgPrice") or mark)
+    if entry <= 0 or filled_qty <= 0:
+        raise RuntimeError("Piyasa emri gerçekleşmiş miktar/fiyat döndürmedi; pozisyon doğrulanmalı.")
+    close_side = "SELL" if direction == "LONG" else "BUY"
+    if direction == "LONG":
+        sl = floor_step(entry * (1 - STOP_LOSS_PCT), tick)
+        tp = floor_step(entry * (1 + TAKE_PROFIT_PCT), tick)
+    else:
+        sl = floor_step(entry * (1 + STOP_LOSS_PCT), tick)
+        tp = floor_step(entry * (1 - TAKE_PROFIT_PCT), tick)
+    try:
+        sl_order = place_protective_order(symbol, close_side, "STOP_MARKET", sl)
+        tp_order = place_protective_order(symbol, close_side, "TAKE_PROFIT_MARKET", tp)
+    except Exception as e:
+        # Koruyucu emirlerden biri kurulamazsa açık pozisyonu piyasa emriyle kapatmayı dene.
+        try:
+            signed_request("POST", "/fapi/v1/order", {
+                "symbol": symbol, "side": close_side, "type": "MARKET",
+                "quantity": format(filled_qty, "f"), "reduceOnly": "true"
+            })
+        finally:
+            raise RuntimeError(f"Koruyucu SL/TP kurulamadı; pozisyonu kapatma denendi. Ayrıntı: {e}")
+    log("ORDER", f"{direction} açıldı. Qty={filled_qty}, giriş={entry}, SL={sl}, TP={tp}; emir={order.get('orderId')}", symbol)
+    return order, sl_order, tp_order
+
+def scan_once(live_enabled):
+    results, errors = [], []
+    for symbol in SYMBOLS:
+        try:
+            results.append(make_signal(symbol))
+        except Exception as e:
+            errors.append(f"{symbol}: {e}")
     with db() as c:
-        account = c.execute("SELECT * FROM account WHERE id=1").fetchone()
-        if account["enabled"]:
-            # Önce açık pozisyonları stop, hedef veya ters sinyalle kapat.
-            for row in c.execute("SELECT * FROM positions").fetchall():
-                if row["coin"] not in results:
-                    continue
-                pair, price, signal, _, _ = results[row["coin"]]
-                direction = 1 if row["side"] == "LONG" else -1
-                move_pct = (price / row["entry"] - 1) * direction * 100
-                reason = ("STOP LOSS" if move_pct <= -STOP_LOSS_PCT else
-                          "TAKE PROFIT" if move_pct >= TAKE_PROFIT_PCT else
-                          "Ters sinyal" if signal in ("LONG","SHORT") and signal != row["side"] else None)
-                if reason:
-                    close_position(c, row["coin"], dict(row), price, reason)
-
-            # Her yeni pozisyon için başlangıç sermayesinin %5'i teminat.
-            account = c.execute("SELECT * FROM account WHERE id=1").fetchone()
-            margin_per_trade = account["initial_capital"] * MARGIN_FRACTION
-            for coin, (pair, price, signal, _, _) in results.items():
-                exists = c.execute("SELECT 1 FROM positions WHERE coin=?", (coin,)).fetchone()
-                if exists or signal not in ("LONG","SHORT"):
-                    continue
-                # Her yeni pozisyon öncesinde güncel bakiyeyi oku.
-                # Böylece aynı taramada kullanılabilir teminattan fazlası ayrılmaz.
-                current_cash = c.execute(
-                    "SELECT cash FROM account WHERE id=1"
-                ).fetchone()["cash"]
-                margin = min(margin_per_trade, current_cash)
-                if margin < 10:
+        c.execute("UPDATE settings SET last_scan=?,last_message=? WHERE id=1",
+                  (now_iso(), f"{len(results)} sembol tarandı; {len(errors)} hata"))
+    if live_enabled:
+        if not ALLOW_LIVE:
+            raise RuntimeError("Canlı emir izni kapalı. Render'da ALLOW_LIVE_TRADING=true olmadan emir gönderilmez.")
+        if not API_KEY or not API_SECRET:
+            raise RuntimeError("Binance API anahtarları eksik.")
+        acct = account_info()
+        equity = float(acct.get("totalWalletBalance", 0)) + float(acct.get("totalUnrealizedProfit", 0))
+        daily_loss_guard(equity)
+        # Tek seferde tek bot pozisyonu; mevcut hesap pozisyonlarına dokunmaz.
+        open_positions = [p for p in position_risk() if abs(float(p["positionAmt"])) > 0]
+        if open_positions:
+            return results, errors, "Hesapta açık Futures pozisyonu var; yeni bot emri güvenlik için atlandı."
+        for item in results:
+            if item and item["signal"] in ("LONG", "SHORT"):
+                try:
+                    open_trade(item["symbol"], item["signal"], equity)
                     break
-                notional = margin * LEVERAGE
-                qty = notional / price
-                c.execute("UPDATE account SET cash=cash-? WHERE id=1", (margin,))
-                c.execute("INSERT INTO positions VALUES(?,?,?,?,?,?,?)",
-                    (coin,pair,signal,price,qty,margin,datetime.now(timezone.utc).isoformat()))
-                c.execute("INSERT INTO trades(at,action,coin,side,price,qty,margin,pnl,reason) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (datetime.now(timezone.utc).isoformat(),"OPEN",coin,signal,price,qty,margin,0.0,
-                     "5x kaldıraç; sermayenin %5'i teminat"))
-        c.execute("UPDATE account SET last_scan=? WHERE id=1",
-                  (datetime.now(timezone.utc).isoformat(),))
-    return results, errors
+                except Exception as e:
+                    errors.append(f"{item['symbol']} emir açılmadı: {e}")
+                    log("WARN", e, item["symbol"])
+    return results, errors, "Tarama tamamlandı."
 
 _worker_started = False
 _worker_lock = threading.Lock()
 
-def background_worker():
-    init_db()
+def worker():
     while True:
         try:
-            run_scan()
-        except Exception:
-            pass
+            with db() as c:
+                enabled = bool(c.execute("SELECT live_enabled FROM settings WHERE id=1").fetchone()[0])
+            scan_once(enabled)
+        except Exception as e:
+            log("ERROR", e)
         time.sleep(SCAN_SECONDS)
 
 def start_worker():
     global _worker_started
     with _worker_lock:
         if not _worker_started:
-            threading.Thread(target=background_worker, daemon=True, name="trader-worker").start()
+            threading.Thread(target=worker, daemon=True, name="binance-futures-worker").start()
             _worker_started = True
 
 init_db()
 start_worker()
 
-st.title("📈 AI TRADER PRO — SANAL VADELİ")
-st.warning("Bu sürüm yalnızca SANAL vadeli işlem simülasyonudur. Gerçek borsaya emir göndermez. 5x kaldıraç kullanılır; LONG ve SHORT sinyalleri ayrı ayrı değerlendirilir. Sonuçlar komisyon/funding içermeyen yaklaşık simülasyondur.")
-with db() as c:
-    account = c.execute("SELECT * FROM account WHERE id=1").fetchone()
-    positions = [dict(x) for x in c.execute("SELECT * FROM positions ORDER BY coin").fetchall()]
-    trades = [dict(x) for x in c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 100").fetchall()]
+st.title("📈 AI TRADER PRO — BINANCE FUTURES")
+st.warning("Gerçek para riski vardır. Gerçek emir modu varsayılan olarak kapalıdır. 5x kaldıraç, bakiye teminatının %5'i, %2 stop-loss ve %4 take-profit kullanılır. Sinyaller EMA20/EMA50 + MACD teknik kurallarıdır; kâr garantisi yoktur.")
+if not ALLOW_LIVE:
+    st.info("Canlı emir izni kapalı. Önce Render Environment Variables bölümünde ALLOW_LIVE_TRADING=true ayarlanmalıdır.")
+if not API_KEY or not API_SECRET:
+    st.info("Binance API anahtarları tanımlı değil. API Key ve Secret yalnızca Render Environment Variables içinde saklanmalıdır.")
 
-st.subheader("Bot kontrolü")
-enabled = st.toggle("Arka plan otomatik sanal vadeli işlemi etkinleştir", value=bool(account["enabled"]))
-if bool(enabled) != bool(account["enabled"]):
+with db() as c:
+    settings = dict(c.execute("SELECT * FROM settings WHERE id=1").fetchone())
+    events = [dict(x) for x in c.execute("SELECT * FROM events ORDER BY id DESC LIMIT 30").fetchall()]
+
+st.subheader("İşlem kontrolü")
+confirm = st.checkbox("Gerçek para ile otomatik Futures emri gönderilmesini ve kayıp riskini kabul ediyorum.")
+can_enable = ALLOW_LIVE and bool(API_KEY and API_SECRET) and confirm
+requested = st.toggle("OTOMATİK GERÇEK İŞLEM", value=bool(settings["live_enabled"]), disabled=not can_enable)
+if requested != bool(settings["live_enabled"]):
     with db() as c:
-        c.execute("UPDATE account SET enabled=? WHERE id=1", (int(enabled),))
+        c.execute("UPDATE settings SET live_enabled=? WHERE id=1", (int(requested),))
+    log("CONTROL", "Canlı otomatik işlem " + ("ETKİN" if requested else "KAPALI"))
     st.rerun()
+if not can_enable and not settings["live_enabled"]:
+    st.caption("Gerçek işlem anahtarı için: ALLOW_LIVE_TRADING=true + API izinleri + yukarıdaki risk onayı gerekir.")
 
-# Gerçekleşmiş kâr/zarar yalnızca kapanan işlemlerden; açık işlemler ayrıca anlık hesaplanır.
-with db() as c:
-    realized_pnl = c.execute(
-        "SELECT COALESCE(SUM(pnl),0) AS total FROM trades WHERE action='CLOSE'"
-    ).fetchone()["total"]
+col1, col2, col3 = st.columns(3)
+col1.metric("Kaldıraç", f"{LEVERAGE}x")
+col2.metric("İşlem teminatı", "%5 kullanılabilir bakiye")
+col3.metric("Tarama aralığı", "60 saniye")
 
-m1,m2,m3,m4 = st.columns(4)
-m1.metric("Kullanılabilir sanal bakiye", f"${account['cash']:,.2f}")
-m2.metric("Gerçekleşmiş K/Z", f"${realized_pnl:,.2f}")
-m3.metric("Kaldıraç", "5x")
-m4.metric("Son arka plan taraması", account["last_scan"][:19].replace("T"," ") if account["last_scan"] != "-" else "Henüz yok")
-
-st.caption("Açık işlemlerin K/Z'si henüz gerçekleşmemiştir; pozisyon kapandığında gerçekleşmiş K/Z'ye eklenir. Değerler komisyon ve funding hariç tahminidir.")
-st.caption("Bot, Render web servisi çalıştığı sürece tarama yapar; tarayıcıyı kapatmanız gerekmez. Render servisi yeniden başlatılırsa /tmp veritabanı sıfırlanabilir.")
-st.subheader("Açık sanal pozisyonlar")
-open_rows = []
-unrealized_pnl = 0.0
-used_margin = 0.0
-if positions:
-    for p in positions:
+if st.button("Şimdi piyasayı tara"):
+    with st.spinner("Binance Futures verileri alınıyor..."):
         try:
-            price, _, _, _ = signal_for(p["pair"])
-            direction = 1 if p["side"] == "LONG" else -1
-            pnl = (price/p["entry"]-1)*direction*p["qty"]
-            unrealized_pnl += pnl
-            used_margin += p["margin"]
-            open_rows.append({"Coin":p["coin"],"Yön":p["side"],"Giriş":round(p["entry"],8),
-                         "Anlık fiyat":round(price,8),"Miktar":round(p["qty"],8),
-                         "Teminat ($)":round(p["margin"],2),"Açık K/Z ($)":round(pnl,4),
-                         "Teminat getirisi (%)":round(pnl/p["margin"]*100,4) if p["margin"] else 0})
+            res, errs, msg = scan_once(False)
+            st.success(msg)
+            if errs:
+                st.warning(" | ".join(errs))
         except Exception as e:
-            open_rows.append({"Coin":p["coin"],"Yön":p["side"],"Fiyat/KZ hatası":str(e)})
-    st.dataframe(pd.DataFrame(open_rows), use_container_width=True, hide_index=True)
-else:
-    st.info("Açık pozisyon yok. Bot etkinleştirilirse sinyale göre sanal pozisyon açabilir.")
-
-k1,k2,k3 = st.columns(3)
-k1.metric("Açık pozisyonların toplam K/Z'si", f"${unrealized_pnl:,.4f}")
-k2.metric("Ayrılmış teminat", f"${used_margin:,.2f}")
-k3.metric("Toplam özsermaye (tahmini)", f"${account['cash'] + used_margin + unrealized_pnl:,.2f}")
-
-st.subheader("Piyasa tarayıcı")
-if st.button("Piyasayı şimdi tara"):
-    with st.spinner("Coinler taranıyor..."):
-        scan_results, scan_errors = run_scan()
-    st.success(f"{len(scan_results)} coin verisi alındı.")
-    if scan_errors:
-        st.warning("Bazı pariteler Kraken tarafından desteklenmiyor veya veri alınamadı: " + ", ".join(scan_errors))
+            st.error(str(e))
     st.rerun()
 
+st.subheader("Canlı piyasa sinyalleri")
 market = []
-for coin, pair in COINS.items():
+for symbol in SYMBOLS:
     try:
-        price, sig, rsi, score = signal_for(pair)
-        market.append({"Coin":coin,"Parite":pair,"Fiyat USD":price,"RSI":round(rsi,1),
-                       "Skor":score,"Sinyal":sig})
+        x = make_signal(symbol)
+        market.append(x)
     except Exception as e:
-        market.append({"Coin":coin,"Parite":pair,"Hata":str(e)})
+        market.append({"symbol": symbol, "signal": "HATA", "price": None, "ema20": None, "ema50": None})
 st.dataframe(pd.DataFrame(market), use_container_width=True, hide_index=True)
 
-st.subheader("İşlem geçmişi (OPEN = açılış, CLOSE = kapanış; gerçekleşmiş K/Z CLOSE satırındadır)")
-if trades:
-    st.dataframe(pd.DataFrame(trades), use_container_width=True, hide_index=True)
+if API_KEY and API_SECRET:
+    st.subheader("Binance Futures hesap durumu")
+    try:
+        a = account_info()
+        b1,b2,b3 = st.columns(3)
+        b1.metric("Wallet balance", f"{float(a.get('totalWalletBalance',0)):.4f} USDT")
+        b2.metric("Available balance", f"{float(a.get('availableBalance',0)):.4f} USDT")
+        b3.metric("Unrealized PnL", f"{float(a.get('totalUnrealizedProfit',0)):.4f} USDT")
+        positions = [p for p in position_risk() if abs(float(p["positionAmt"])) > 0]
+        st.write("Açık Futures pozisyonları")
+        if positions:
+            st.dataframe(pd.DataFrame([{
+                "Sembol": p["symbol"], "Miktar": p["positionAmt"],
+                "Giriş": p["entryPrice"], "Mark": p["markPrice"],
+                "Gerçekleşmemiş K/Z": p["unRealizedProfit"],
+                "Likidasyon fiyatı": p["liquidationPrice"]
+            } for p in positions]), use_container_width=True, hide_index=True)
+        else:
+            st.info("Açık Futures pozisyonu bulunamadı.")
+    except Exception as e:
+        st.error(f"Hesap bilgisi alınamadı: {e}")
+
+st.subheader("Bot olayları ve emir kayıtları")
+if events:
+    st.dataframe(pd.DataFrame(events), use_container_width=True, hide_index=True)
 else:
-    st.caption("Henüz işlem kaydı yok.")
-st.caption("Pozisyon boyutu: teminat × 5. Her işlemde başlangıç sermayesinin %5'i teminat olarak ayrılır. Stop-loss %2, take-profit %4; tasfiye/funding/komisyon modeli basitleştirilmiştir.")
+    st.info("Henüz bot olayı yok.")
+
+st.caption("Uyarı: Sunucu/bağlantı kesintisi, kayma, likidasyon, komisyon ve funding kayıpları artırabilir. Stop emri mutlak fiyat garantisi vermez. Bu yazılım yatırım tavsiyesi değildir.")
